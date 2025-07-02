@@ -1,7 +1,9 @@
 import { Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
 import { TypeOrmModule } from "@nestjs/typeorm";
-import { SubscriptionModule } from './subscription/subscription.module';
+import { SubscriptionModule } from "./subscription/subscription.module";
+import { PlansModule } from "./plans/plans.module";
+import { AuthModule } from "./auth/auth.module";
 @Module({
   imports: [
     ConfigModule.forRoot(),
@@ -16,6 +18,8 @@ import { SubscriptionModule } from './subscription/subscription.module';
       synchronize: true,
     }),
     SubscriptionModule,
+    PlansModule,
+    AuthModule,
   ],
   controllers: [],
   providers: [],
