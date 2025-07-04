@@ -6,7 +6,7 @@ import {
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { InjectRepository } from "@nestjs/typeorm";
-import MercadoPagoConfig, { PreApproval } from "mercadopago";
+import MercadoPagoConfig, { Payment, PreApproval } from "mercadopago";
 import {
   Subscription,
   SubscriptionStatus,
@@ -15,6 +15,7 @@ import { Repository } from "typeorm";
 import { PlansService } from "src/plans/plans.service";
 import { CreateSubscriptionDto } from "./dto/create-subscription.dto";
 import { User } from "src/auth/entities/user.entity";
+import { Plan } from "src/plans/entities/plan.entity";
 
 @Injectable()
 export class SubscriptionService {
@@ -24,6 +25,10 @@ export class SubscriptionService {
   constructor(
     @InjectRepository(Subscription)
     private subscriptionRepository: Repository<Subscription>,
+    // @InjectRepository(User)
+    // private userRepository: Repository<User>,
+    // @InjectRepository(Plan)
+    // private planRepository: Repository<Plan>,
     private readonly planService: PlansService,
     private readonly configService: ConfigService
   ) {
@@ -40,13 +45,6 @@ export class SubscriptionService {
     const { email, planId, amount } = createSubscriptionDto;
 
     try {
-      const existingSubscription = await this.subscriptionRepository.findOne({
-        where: {
-          user: { id: user.id },
-        },
-        relations: ["user", "plan"],
-      });
-
       const plan = await this.planService.findOne(planId);
       if (!plan || plan.status !== "active")
         throw new NotFoundException("Plan no encontrado o inactivo");
@@ -56,66 +54,28 @@ export class SubscriptionService {
           "El monto no coincide con el precio del plan"
         );
       }
-      console.log(
-        " SubscriptionService - existingSubscription",
-        existingSubscription
-      );
 
-      if (
-        existingSubscription &&
-        existingSubscription?.plan.id === planId &&
-        existingSubscription.status !== SubscriptionStatus.CANCELLED
-      ) {
-        throw new BadRequestException(
-          "El usuario ya tiene una suscripción activa para este plan"
-        );
-      }
-
-      if (
-        existingSubscription &&
-        existingSubscription.plan.id !== planId &&
-        existingSubscription.status !== SubscriptionStatus.CANCELLED
-      ) {
-        await this.cancelCurrentSubscriptionForUpgrade(existingSubscription!);
-      }
+      const externalReference = `subscription_${user.id}_${Date.now()}`;
 
       const mpSubscription = await this.preApproval.create({
         body: {
-          reason: `Suscripción ${plan.name}`,
+          payer_email: email,
           auto_recurring: {
             frequency: 1,
             frequency_type: "months",
             transaction_amount: amount,
             currency_id: "ARS",
           },
-          payer_email: email,
-          back_url: "https://e761-45-226-58-78.ngrok-free.app/success",
+          reason: `${plan.name}`,
+          back_url: "https://2a4a-45-226-58-64.ngrok-free.app/succes",
+          external_reference: externalReference,
           status: "pending",
         },
       });
 
-      const subscription = this.subscriptionRepository.create({
-        mercadopagoId: mpSubscription.id,
-        user,
-        plan,
-        status: SubscriptionStatus.PENDING,
-        amount,
-        currencyId: "ARS",
-        frequencyType: "months",
-        frequency: 1,
-        paymentUrl: mpSubscription.init_point,
-        backUrl: mpSubscription.back_url,
-        externalReference: `subscription_${user.id}_${Date.now()}`,
-      });
-
-      const savedSubscription =
-        await this.subscriptionRepository.save(subscription);
       return {
-        id: savedSubscription.id,
-        mercadopagoId: mpSubscription.id,
         paymentUrl: mpSubscription.init_point,
-        status: "created",
-        subscription: savedSubscription,
+        externalReference,
       };
     } catch (error) {
       console.error("Error:", error);
@@ -160,8 +120,12 @@ export class SubscriptionService {
         where: { id },
         relations: ["user", "plan"],
       });
+      console.log(
+        " SubscriptionService - getSubscription - localSubscription",
+        localSubscription
+      );
 
-      if (!localSubscription) {
+      if (!localSubscription || localSubscription === null) {
         throw new NotFoundException("Suscripción no encontrada");
       }
 
@@ -179,149 +143,5 @@ export class SubscriptionService {
     }
   }
 
-  // WEBHOOKS HANDLERS
-
-  async proccessPaymentWebhook(paymentData: any) {
-    try {
-      const { external_reference, status } = paymentData;
-
-      if (!external_reference) {
-        throw new BadRequestException("No external_reference found in payment");
-      }
-
-      const subscription = await this.subscriptionRepository.findOne({
-        where: {
-          externalReference: external_reference,
-        },
-        relations: ["user", "plan"],
-      });
-
-      if (!subscription)
-        throw new NotFoundException(
-          `Suscripción no encontrada para external_reference: ${external_reference}`
-        );
-
-      switch (status) {
-        case "approved":
-          await this.handleApprovedPayment(subscription, paymentData);
-          break;
-        case "rejected":
-          await this.handleRejectedPayment(subscription, paymentData);
-          break;
-        case "pending":
-          await this.handlePendingPayment(subscription, paymentData);
-          break;
-        case "cancelled":
-          await this.handleCancelledPayment(subscription, paymentData);
-          break;
-      }
-    } catch (error) {
-      console.error("Error procesando webhook de pago:", error);
-      throw error;
-    }
-  }
-
-  async handleApprovedPayment(subscription: Subscription, paymentData: any) {
-    try {
-      subscription.status = SubscriptionStatus.AUTHORIZED;
-      subscription.lastPaymentDate = new Date(paymentData.date_approved);
-      subscription.nextPaymentDate = this.calculateNextPaymentDate(
-        subscription.frequencyType,
-        subscription.frequency
-      );
-      subscription.paymentStatus = "paid";
-      subscription.failedPaymentCount = 0;
-
-      await this.subscriptionRepository.save(subscription);
-    } catch (error) {
-      console.error("Error manejando pago aprobado:", error);
-      throw error;
-    }
-  }
-
-  async handleRejectedPayment(subscription: Subscription, paymentData: any) {
-    try {
-      subscription.paymentStatus = "failed";
-      subscription.failedPaymentCount =
-        (subscription.failedPaymentCount || 0) + 1;
-
-      if (subscription.failedPaymentCount >= 3) {
-        subscription.status = SubscriptionStatus.SUSPENDED;
-        subscription.suspendedAt = new Date();
-      }
-
-      await this.subscriptionRepository.save(subscription);
-
-      console.log(`Pago rechazado para suscripción: ${subscription.id}`);
-    } catch (error) {
-      console.error("Error manejando pago rechazado:", error);
-      throw error;
-    }
-  }
-
-  async handlePendingPayment(subscription: Subscription, paymentData: any) {
-    try {
-      subscription.paymentStatus = "pending";
-      await this.subscriptionRepository.save(subscription);
-
-      console.log(`Pago pendiente para suscripción: ${subscription.id}`);
-    } catch (error) {
-      console.error("Error manejando pago pendiente:", error);
-      throw error;
-    }
-  }
-
-  async handleCancelledPayment(subscription: Subscription, paymentData: any) {
-    try {
-      subscription.status = SubscriptionStatus.CANCELLED;
-      subscription.cancelledAt = new Date();
-      await this.subscriptionRepository.save(subscription);
-
-      console.log(`Pago cancelado para suscripción: ${subscription.id}`);
-    } catch (error) {
-      console.error("Error manejando pago cancelado:", error);
-      throw error;
-    }
-  }
-
-  // PRIVATE METHODS
-  private async cancelCurrentSubscriptionForUpgrade(
-    subscription: Subscription
-  ) {
-    try {
-      await this.preApproval.update({
-        id: subscription.mercadopagoId,
-        body: {
-          status: "cancelled",
-        },
-      });
-
-      subscription.status = SubscriptionStatus.CANCELLED;
-      subscription.cancelReason = "upgrade";
-      await this.subscriptionRepository.save(subscription);
-
-      console.log(`Suscripción ${subscription.id} cancelada para upgrade`);
-    } catch (error) {
-      console.error("Error cancelando suscripción para upgrade:", error);
-      throw new InternalServerErrorException("Error procesando cambio de plan");
-    }
-  }
-
-  private calculateNextPaymentDate(
-    frequencyType: string,
-    frequency: number
-  ): Date {
-    const now = new Date();
-
-    switch (frequencyType) {
-      case "months":
-        return new Date(now.setMonth(now.getMonth() + frequency));
-      case "days":
-        return new Date(now.setDate(now.getDate() + frequency));
-      case "years":
-        return new Date(now.setFullYear(now.getFullYear() + frequency));
-      default:
-        return new Date(now.setMonth(now.getMonth() + 1));
-    }
-  }
+  // TODO -> WEBHOOKS HANDLERS
 }
